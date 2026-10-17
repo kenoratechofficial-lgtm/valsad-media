@@ -11,3 +11,5 @@ const importedNewsSchema=new Schema({provider:String,externalId:String,originalU
 importedNewsSchema.index({provider:1,externalId:1},{unique:true,sparse:true});
 export const ImportedNews=model('ImportedNews',importedNewsSchema);
 export const AuditLog=model('AuditLog',new Schema({user:{type:Schema.Types.ObjectId,ref:'User'},action:String,entity:String,entityId:String,details:Schema.Types.Mixed,ip:String},{timestamps:true}));
+export const Visitor=model('Visitor',new Schema({visitorId:{type:String,required:true,unique:true,index:true},firstSeen:{type:Date,default:Date.now},lastSeen:{type:Date,default:Date.now,index:true},currentPath:{type:String,default:'/en'}},{timestamps:true}));
+export const PageView=model('PageView',new Schema({visitorId:{type:String,required:true,index:true},path:{type:String,required:true,index:true},createdAt:{type:Date,default:Date.now,index:true}},{versionKey:false}));
