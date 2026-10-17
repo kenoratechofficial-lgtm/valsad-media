@@ -110,7 +110,7 @@ api.post('/admin/articles',async(req,res,next)=>{try{const input=z.object({title
 api.patch('/admin/articles/:id',async(req,res,next)=>{try{const a=await Article.findByIdAndUpdate(req.params.id,{$set:req.body},{new:true,runValidators:true});if(!a)return res.status(404).json({error:'Article not found'});await audit(req,'article.update','Article',a.id);res.json(a)}catch(e){next(e)}});
 api.delete('/admin/articles/:id',async(req,res,next)=>{try{const a=await Article.findByIdAndDelete(req.params.id);if(!a)return res.status(404).json({error:'Article not found'});await audit(req,'article.delete','Article',req.params.id);res.json({ok:true})}catch(e){next(e)}});
 api.post('/admin/articles/:id/publish',async(req,res,next)=>{try{const a=await Article.findByIdAndUpdate(req.params.id,{status:'published',publishedAt:new Date(),scheduledAt:null},{new:true});if(!a)return res.status(404).json({error:'Article not found'});await audit(req,'article.publish','Article',a.id);res.json(a)}catch(e){next(e)}});
-api.get('/admin/imported-news',async(req,res,next)=>{try{const filter={reviewStatus:'pending'};const items=await ImportedNews.find(filter).sort({publishedAt:-1}).limit(100);res.json({items})}catch(e){next(e)}});
+api.get('/admin/imported-news',async(req,res,next)=>{try{const filter={reviewStatus:'pending'};const fetched=await ImportedNews.find(filter).sort({publishedAt:-1}).limit(250);const unique=new Map();for(const item of fetched){const key=`${item.category||''}:${item.originalUrl||item.id}`;const previous=unique.get(key);if(!previous||(previous.language==='gu'&&item.language==='en'))unique.set(key,item)}res.json({items:[...unique.values()].slice(0,100)})}catch(e){next(e)}});
 api.post('/admin/imported-news/fetch-bilingual',async(req,res,next)=>{
  try{
   const provider=(process.env.NEWS_PROVIDER||'').trim().toLowerCase(),apiKey=(process.env.NEWS_API_KEY||'').trim();
@@ -133,8 +133,8 @@ api.post('/admin/imported-news/fetch-bilingual',async(req,res,next)=>{
   const fetchedAt=new Date(),deduped=new Map();
   for(const result of results)for(const article of result.articles){
    if(!article.url||!article.title)continue;
-   const externalId=`${result.language}:${article.url}`;
-   deduped.set(externalId,{language:result.language,article,externalId});
+   const externalId=article.url;
+   if(!deduped.has(externalId))deduped.set(externalId,{language:result.language,article,externalId});
   }
   const stories=[...deduped.values()];
   const operations=stories.map(({language,article,externalId})=>({updateOne:{filter:{provider,externalId},update:{$set:{category:slug,language,fetchedAt,...(article.image?{imageUrl:article.image}:{})},$setOnInsert:{provider,externalId,originalUrl:article.url,sourceName:article.source?.name||'GNews',title:article.title,description:article.description||'',publishedAt:article.publishedAt?new Date(article.publishedAt):null,reviewStatus:'pending'}},upsert:true}}));
