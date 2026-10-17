@@ -10,6 +10,7 @@ import bcrypt from 'bcryptjs';
 import {createHash,randomUUID} from 'node:crypto';
 import {z} from 'zod';
 import {Article,Category,Location,User,AuditLog,ImportedNews,Visitor,PageView} from './models.js';
+import {GNewsApiError,GNewsFetchGate,GNewsFetchGateError,gnewsAdminMessage,requestGNews} from './gnews.js';
 
 const app=express(),port=process.env.PORT||5000,prod=process.env.NODE_ENV==='production';
 app.set('trust proxy',1);app.use(helmet());app.use(cors({origin:process.env.CLIENT_URL||'http://localhost:5173',credentials:true}));app.use(express.json({limit:'1mb'}));
@@ -21,6 +22,12 @@ const currentPublishedFilter=()=>({status:'published',publishedAt:{$lte:new Date
 const auth=(req,res,next)=>req.session.user?next():res.status(401).json({error:'Authentication required'});
 const admin=(req,res,next)=>req.session.user?.role==='admin'?next():res.status(403).json({error:'Administrator access required'});
 const audit=(req,action,entity,entityId)=>AuditLog.create({user:req.session.user?.id,action,entity,entityId,ip:req.ip});
+const gnewsFetchGate=new GNewsFetchGate({cooldownMs:Math.max(5_000,Number(process.env.GNEWS_FETCH_COOLDOWN_MS)||15_000)});
+const replyGNewsError=(res,error)=>{
+ if(error instanceof GNewsFetchGateError){if(error.retryAfter)res.set('Retry-After',String(error.retryAfter));res.status(error.status).json({error:error.message,retryAfter:error.retryAfter||undefined});return true}
+ if(error instanceof GNewsApiError){if(error.status===429)res.set('Retry-After',String(Math.ceil((Number(process.env.GNEWS_FETCH_COOLDOWN_MS)||15_000)/1000)));const status=error.status===400||error.status===403||error.status===429?error.status:502;res.status(status).json({error:gnewsAdminMessage(error.status),...(error.upstreamStatus?{upstreamStatus:error.upstreamStatus}:{})});return true}
+ return false;
+};
 api.get('/health',(_,res)=>res.json({ok:true,service:'ValsadMedia API'}));
 const visitorInput=z.object({visitorId:z.string().uuid(),path:z.string().regex(/^\/(en|gu)(\/|$)/).max(300)});
 const updateVisitor=async(visitorId,path)=>{
@@ -113,6 +120,7 @@ api.delete('/admin/articles/:id',async(req,res,next)=>{try{const a=await Article
 api.post('/admin/articles/:id/publish',async(req,res,next)=>{try{const a=await Article.findByIdAndUpdate(req.params.id,{status:'published',publishedAt:new Date(),scheduledAt:null},{new:true});if(!a)return res.status(404).json({error:'Article not found'});await audit(req,'article.publish','Article',a.id);res.json(a)}catch(e){next(e)}});
 api.get('/admin/imported-news',async(req,res,next)=>{try{const filter={reviewStatus:'pending'};const fetched=await ImportedNews.find(filter).sort({publishedAt:-1}).limit(250);const unique=new Map();for(const item of fetched){const key=`${item.category||''}:${item.originalUrl||item.id}`;const previous=unique.get(key);if(!previous||(previous.language==='gu'&&item.language==='en'))unique.set(key,item)}res.json({items:[...unique.values()].slice(0,100)})}catch(e){next(e)}});
 api.post('/admin/imported-news/fetch-bilingual',async(req,res,next)=>{
+ let releaseFetch;
  try{
   const provider=(process.env.NEWS_PROVIDER||'').trim().toLowerCase(),apiKey=(process.env.NEWS_API_KEY||'').trim();
   if(provider!=='gnews')return res.status(400).json({error:`Unsupported NEWS_PROVIDER: ${provider||'not configured'}. Set it to gnews.`});
@@ -123,14 +131,12 @@ api.post('/admin/imported-news/fetch-bilingual',async(req,res,next)=>{
   const slug=category.slug?.en||category.slug?.gu||'general';
   const topics={gujarat:'general','local-news':'general',india:'nation',world:'world',politics:'nation',business:'business',sports:'sports',technology:'technology',entertainment:'entertainment',education:'science',lifestyle:'health',health:'health'};
   const topic=topics[slug]||'general';
-  const fetchLanguage=async language=>{
-   const params=new URLSearchParams({category:topic,lang:language,country:'in',max:'10',apikey:apiKey,q:input.q?.trim()||'Valsad OR Vapi OR Gujarat'});
-   const response=await fetch(`https://gnews.io/api/v4/top-headlines?${params}`,{signal:AbortSignal.timeout(20000)});
-   if(!response.ok){const message=response.status===401?'GNews rejected the API key. Check NEWS_API_KEY.':response.status===403?'GNews quota reached or access denied. Check your GNews plan.':response.status===429?'GNews rate limit reached. Try again shortly.':`GNews request failed (${response.status}).`;throw new Error(message)}
-   const payload=await response.json();
-   return {language,articles:Array.isArray(payload.articles)?payload.articles:[]};
-  };
-  const results=await Promise.all(['en','gu'].map(fetchLanguage));
+  releaseFetch=gnewsFetchGate.acquire(req.sessionID);
+  const results=[];
+  for(const language of ['en','gu']){
+   const payload=await requestGNews({apiKey,category:topic,language,q:input.q?.trim()||'Valsad OR Vapi OR Gujarat'});
+   results.push({language,articles:Array.isArray(payload.articles)?payload.articles:[]});
+  }
   const fetchedAt=new Date(),deduped=new Map();
   for(const result of results)for(const article of result.articles){
    if(!article.url||!article.title)continue;
@@ -142,9 +148,29 @@ api.post('/admin/imported-news/fetch-bilingual',async(req,res,next)=>{
   if(operations.length)await ImportedNews.bulkWrite(operations,{ordered:false});
   const items=operations.length?await ImportedNews.find({reviewStatus:'pending',provider,category:slug,externalId:{$in:stories.map(story=>story.externalId)}}).sort({publishedAt:-1}):[];
   res.json({fetched:stories.length,byLanguage:{en:results.find(result=>result.language==='en').articles.length,gu:results.find(result=>result.language==='gu').articles.length},category:slug,topic,items});
- }catch(e){if(e.message?.startsWith('GNews '))return res.status(502).json({error:e.message});next(e)}
+ }catch(e){if(replyGNewsError(res,e))return;next(e)}finally{releaseFetch?.()}
 });
-api.post('/admin/imported-news/fetch',async(req,res,next)=>{try{const provider=(process.env.NEWS_PROVIDER||'').trim().toLowerCase(),apiKey=(process.env.NEWS_API_KEY||'').trim();if(provider!=='gnews')return res.status(400).json({error:`Unsupported NEWS_PROVIDER: ${provider||'not configured'}. Set it to gnews.`});if(!apiKey)return res.status(400).json({error:'NEWS_API_KEY is not configured.'});const input=z.object({q:z.string().trim().max(200).optional(),lang:z.enum(['en','gu']).default('en'),categoryId:z.string().min(1)}).parse(req.body);const category=await Category.findById(input.categoryId);if(!category)return res.status(400).json({error:'Choose a valid newsroom category.'});const slug=category.slug?.en||category.slug?.gu||'general';const topics={gujarat:'general','local-news':'general',india:'nation',world:'world',politics:'nation',business:'business',sports:'sports',technology:'technology',entertainment:'entertainment',education:'science',lifestyle:'health',health:'health'};const topic=topics[slug]||'general';const params=new URLSearchParams({category:topic,lang:input.lang,country:'in',max:'10',apikey:apiKey,q:input.q?.trim()||'Valsad OR Vapi OR Gujarat'});const response=await fetch(`https://gnews.io/api/v4/top-headlines?${params}`,{signal:AbortSignal.timeout(15000)});if(!response.ok){const message=response.status===401?'GNews rejected the API key. Check NEWS_API_KEY.':response.status===429?'GNews rate limit reached. Try again later.':`GNews request failed (${response.status}).`;return res.status(502).json({error:message})}const payload=await response.json(),articles=Array.isArray(payload.articles)?payload.articles:[],now=new Date();const operations=articles.filter(a=>a.url&&a.title).map(a=>({updateOne:{filter:{provider,externalId:a.url},update:{$set:{category:slug,language:input.lang,fetchedAt:now,...(a.image?{imageUrl:a.image}:{})},$setOnInsert:{provider,externalId:a.url,originalUrl:a.url,sourceName:a.source?.name||'GNews',title:a.title,description:a.description||'',publishedAt:a.publishedAt?new Date(a.publishedAt):null,reviewStatus:'pending'}},upsert:true}}));if(operations.length)await ImportedNews.bulkWrite(operations,{ordered:false});const items=await ImportedNews.find({reviewStatus:'pending',provider,category:slug,externalId:{$in:operations.map(x=>x.updateOne.filter.externalId)}}).sort({publishedAt:-1});res.json({fetched:articles.length,added:items.length,category:slug,topic,items})}catch(e){next(e)}});
+api.post('/admin/imported-news/fetch',async(req,res,next)=>{
+ let releaseFetch;
+ try{
+  const provider=(process.env.NEWS_PROVIDER||'').trim().toLowerCase(),apiKey=(process.env.NEWS_API_KEY||'').trim();
+  if(provider!=='gnews')return res.status(400).json({error:`Unsupported NEWS_PROVIDER: ${provider||'not configured'}. Set it to gnews.`});
+  if(!apiKey)return res.status(400).json({error:'NEWS_API_KEY is not configured.'});
+  const input=z.object({q:z.string().trim().max(200).optional(),lang:z.enum(['en','gu']).default('en'),categoryId:z.string().min(1)}).parse(req.body);
+  const category=await Category.findById(input.categoryId);
+  if(!category)return res.status(400).json({error:'Choose a valid newsroom category.'});
+  const slug=category.slug?.en||category.slug?.gu||'general';
+  const topics={gujarat:'general','local-news':'general',india:'nation',world:'world',politics:'nation',business:'business',sports:'sports',technology:'technology',entertainment:'entertainment',education:'science',lifestyle:'health',health:'health'};
+  const topic=topics[slug]||'general';
+  releaseFetch=gnewsFetchGate.acquire(req.sessionID);
+  const payload=await requestGNews({apiKey,category:topic,language:input.lang,q:input.q?.trim()||'Valsad OR Vapi OR Gujarat'});
+  const articles=Array.isArray(payload.articles)?payload.articles:[],now=new Date();
+  const operations=articles.filter(article=>article.url&&article.title).map(article=>({updateOne:{filter:{provider,externalId:article.url},update:{$set:{category:slug,language:input.lang,fetchedAt:now,...(article.image?{imageUrl:article.image}:{})},$setOnInsert:{provider,externalId:article.url,originalUrl:article.url,sourceName:article.source?.name||'GNews',title:article.title,description:article.description||'',publishedAt:article.publishedAt?new Date(article.publishedAt):null,reviewStatus:'pending'}},upsert:true}}));
+  if(operations.length)await ImportedNews.bulkWrite(operations,{ordered:false});
+  const items=await ImportedNews.find({reviewStatus:'pending',provider,category:slug,externalId:{$in:operations.map(operation=>operation.updateOne.filter.externalId)}}).sort({publishedAt:-1});
+  res.json({fetched:articles.length,added:items.length,category:slug,topic,items});
+ }catch(error){if(replyGNewsError(res,error))return;next(error)}finally{releaseFetch?.()}
+});
 api.post('/admin/imported-news/:id/import',async(req,res,next)=>{try{const item=await ImportedNews.findOne({_id:req.params.id,reviewStatus:'pending'});if(!item)return res.status(404).json({error:'News item not found or already imported'});const category=await Category.findOne({'slug.en':item.category});const slug=(item.title||'news-story').toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'')||`news-${item.id}`;const lang=item.language==='gu'?'gu':'en',title={en:lang==='en'?item.title:'',gu:lang==='gu'?item.title:''},excerpt={en:lang==='en'?(item.description||''):'',gu:lang==='gu'?(item.description||''):''};const article=await Article.create({title,slug:{en:`${slug}-${item.id.slice(-6)}`,gu:`${slug}-${item.id.slice(-6)}`},excerpt,content:{en:'',gu:''},availableLanguages:[lang],category:category?._id,status:'draft',publishedAt:null,featuredImage:{url:item.imageUrl||'',alt:title},source:{name:item.sourceName,url:item.originalUrl,provider:item.provider},author:req.session.user.id});item.reviewStatus='imported';item.linkedArticle=article._id;await item.save();await audit(req,'news.import','ImportedNews',item.id);res.status(201).json({article,item})}catch(e){next(e)}});
 api.get('/admin/categories',async(_,res,next)=>{try{res.json(await Category.find().sort({sortOrder:1}))}catch(e){next(e)}});api.post('/admin/categories',async(req,res,next)=>{try{const c=await Category.create(req.body);await audit(req,'category.create','Category',c.id);res.status(201).json(c)}catch(e){next(e)}});api.patch('/admin/categories/:id',async(req,res,next)=>{try{res.json(await Category.findByIdAndUpdate(req.params.id,{$set:req.body},{new:true,runValidators:true}))}catch(e){next(e)}});api.delete('/admin/categories/:id',async(req,res,next)=>{try{if(await Article.exists({category:req.params.id}))return res.status(409).json({error:'Category is referenced by articles'});await Category.findByIdAndDelete(req.params.id);res.json({ok:true})}catch(e){next(e)}});
 api.get('/admin/locations',async(_,res,next)=>{try{res.json(await Location.find().populate('parent','name type').sort({name:1}))}catch(e){next(e)}});api.post('/admin/locations',async(req,res,next)=>{try{const schema=z.object({name:z.string().min(2),slug:z.string().min(2),type:z.enum(['state','district','city','taluka','locality']),parent:z.string().nullable().optional()});const x=schema.parse(req.body);const l=await Location.create(x);await audit(req,'location.create','Location',l.id);res.status(201).json(l)}catch(e){next(e)}});api.patch('/admin/locations/:id',async(req,res,next)=>{try{res.json(await Location.findByIdAndUpdate(req.params.id,{$set:req.body},{new:true,runValidators:true}))}catch(e){next(e)}});api.delete('/admin/locations/:id',async(req,res,next)=>{try{if(await Article.exists({locations:req.params.id}))return res.status(409).json({error:'Location is referenced by articles'});await Location.findByIdAndDelete(req.params.id);res.json({ok:true})}catch(e){next(e)}});

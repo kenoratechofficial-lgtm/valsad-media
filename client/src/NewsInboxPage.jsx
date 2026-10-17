@@ -55,7 +55,7 @@ export default function NewsInboxPage() {
     setError('');
     setNotice('');
     try {
-      const { data } = await api.post('/admin/imported-news/fetch-bilingual', { q: query, categoryId });
+      const { data } = await api.post('/admin/imported-news/fetch-bilingual', { q: query, categoryId }, { timeout: 60_000 });
       setItems(previous => [...data.items, ...previous.filter(item => !data.items.some(next => next._id === item._id))]);
       setNotice('Fetched ' + data.fetched + ' stories: ' + data.byLanguage.en + ' English and ' + data.byLanguage.gu + ' Gujarati. Choose a story below to import it as a draft.');
     } catch (requestError) {

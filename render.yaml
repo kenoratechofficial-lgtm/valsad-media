@@ -20,6 +20,8 @@ services:
         value: gnews
       - key: NEWS_API_KEY
         sync: false
+      - key: GNEWS_FETCH_COOLDOWN_MS
+        value: "15000"
       - key: CLOUDINARY_CLOUD_NAME
         sync: false
       - key: CLOUDINARY_API_KEY
