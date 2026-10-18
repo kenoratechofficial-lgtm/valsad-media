@@ -1,6 +1,6 @@
 # ValsadMedia
 
-ValsadMedia is a bilingual regional news portal starter for Valsad and Gujarat. It contains a React/Vite responsive editorial interface and an Express/Mongoose API with session authentication, article/category/location models, public content endpoints, admin CRUD endpoints, and a secure initial-admin seed command.
+ValsadMedia is a bilingual regional news portal starter for Valsad and Gujarat. It contains a React/Vite responsive editorial interface and an Express/Mongoose API with session authentication, article/category/location models, public content endpoints, and admin CRUD endpoints.
 
 ## Project structure
 
@@ -12,7 +12,6 @@ client/                 React + Vite website
 server/                 Express + MongoDB API
   src/index.js            REST API and session middleware
   src/models.js           Mongoose models and indexes
-  src/seed-admin.js       Initial admin and directory seed
 ```
 
 ## Requirements and local setup
@@ -24,17 +23,14 @@ server/                 Express + MongoDB API
 npm install
 ```
 
-Copy `server/.env.example` to `server/.env`. Set `MONGODB_URI`, a random `SESSION_SECRET` of 32+ characters, `ADMIN_EMAIL`, and a strong `ADMIN_PASSWORD`. Then:
+Copy `server/.env.example` to `server/.env`. Set `MONGODB_URI` and a random `SESSION_SECRET` of 32+ characters. Then:
 
 ```sh
-npm run seed-admin -w server
-npm run seed-locations -w server
 npm run dev
 ```
 
 Vite serves the site at `http://localhost:5173`; the API listens on `http://localhost:5000`. Vite proxies `/api` to the API. Configure `CLIENT_URL` to the exact client origin. Do not commit `.env` files.
 
-The admin seed creates the administrator only when that email is absent and seeds initial categories. The location seed is safe to rerun and creates the listed Gujarat districts and their cities/talukas, plus Dadra and Nagar Haveli and Daman. It never prints the administrator password.
 
 ## Environment
 
@@ -53,7 +49,6 @@ The repository includes `render.yaml` for the API and `client/vercel.json` for t
 3. In Vercel, import the same GitHub repository as a separate project with **Root Directory** set to `client`, framework **Vite**, build command `npm run build`, and output directory `dist`. No `VITE_API_BASE_URL` is needed because `/api` is proxied by Vercel.
 4. The included proxy points to `https://valsadmedia-api.onrender.com`. If Render assigns a different hostname, update the first destination in `client/vercel.json` to the exact Render service URL and redeploy Vercel.
 5. Copy the Vercel production URL (for example, `https://your-project.vercel.app`) into Render's `CLIENT_URL`, then redeploy the Render service. Keep `NEWS_PROVIDER=gnews` and enter the GNews key as `NEWS_API_KEY` in Render, not Vercel.
-6. Seed initial content and the admin once after Render connects to Atlas. Supply `ADMIN_EMAIL` and `ADMIN_PASSWORD` only for the seed command; the script stores a bcrypt password hash in MongoDB. Run `npm run seed-admin` and `npm run seed-locations` from `server/` with the production `MONGODB_URI` available.
 7. Verify `/api/v1/health` on the Render URL, the Vercel home page, admin login, fetching GNews, and publishing an article. Add a custom domain to Vercel afterward and update `CLIENT_URL` in Render to that exact origin.
 
 Render's service setup follows its [Node web service](https://render.com/docs/deploy-node-express-app) and [Blueprint](https://render.com/docs/blueprint-spec) configuration. Vercel's SPA rewrite supports direct links to routes such as `/gu/news/...` and `/admin/dashboard` ([Vite on Vercel](https://vercel.com/docs/frameworks/frontend/vite)).
